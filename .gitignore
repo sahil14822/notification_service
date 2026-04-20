@@ -26,3 +26,7 @@ Thumbs.db
 
 # Environment context
 .env
+
+#Proto
+.proto
+.pb.go
