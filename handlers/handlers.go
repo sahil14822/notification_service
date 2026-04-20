@@ -4,16 +4,30 @@ package handlers
 import (
 	"encoding/json"
 	"errors"
+	"io"
 	"net/http"
-	"strings"
-
+	"notification-service/logger"
 	"notification-service/models"
+	pb "notification-service/proto"
 	"notification-service/services"
+	"strings"
 )
+
+var log = logger.NewLogger("notification-service")
 
 // Handler holds a reference to the service layer.
 type Handler struct {
 	service *services.Service
+}
+
+type GRPCServer struct {
+	pb.UnimplementedNotificationServiceServer
+	h *Handler
+}
+
+// NewGRPCServer returns a GRPCServer backed by the given handler
+func NewGRPCServer(h *Handler) pb.NotificationServiceServer {
+	return &GRPCServer{h: h}
 }
 
 // New returns a Handler backed by the given service.
@@ -29,7 +43,12 @@ func writeJSON(w http.ResponseWriter, status int, v any) {
 	json.NewEncoder(w).Encode(v)
 }
 
+func writeLog(msg string) {
+	log.Info(msg)
+}
+
 func writeError(w http.ResponseWriter, status int, msg string) {
+	// log.Error(msg)
 	writeJSON(w, status, map[string]string{"error": msg})
 }
 
@@ -88,6 +107,7 @@ func (h *Handler) CreateTemplate(w http.ResponseWriter, r *http.Request) {
 	}
 
 	// response includes Variables slice transparently handled by service layer
+	writeLog("Created template with ID: " + resp.ID + "Content is: " + resp.Content)
 	writeJSON(w, http.StatusCreated, resp)
 }
 
@@ -99,6 +119,7 @@ func (h *Handler) CreateTemplate(w http.ResponseWriter, r *http.Request) {
 // @Success      200  {array} models.Template
 // @Router       /templates [get]
 func (h *Handler) ListTemplates(w http.ResponseWriter, r *http.Request) {
+	writeLog("Listing all templates")
 	writeJSON(w, http.StatusOK, h.service.ListTemplates())
 }
 
@@ -124,6 +145,7 @@ func (h *Handler) GetTemplate(w http.ResponseWriter, r *http.Request) {
 		writeError(w, determineErrorStatus(err), err.Error())
 		return
 	}
+	writeLog("Getting Template By ID: " + id)
 	writeJSON(w, http.StatusOK, t)
 }
 
@@ -163,7 +185,7 @@ func (h *Handler) UpdateTemplate(w http.ResponseWriter, r *http.Request) {
 		writeError(w, determineErrorStatus(err), err.Error())
 		return
 	}
-
+	writeLog("Updating Template With Id:" + resp.ID + "Content is: " + resp.Content)
 	writeJSON(w, http.StatusOK, resp)
 }
 
@@ -189,7 +211,7 @@ func (h *Handler) DeleteTemplate(w http.ResponseWriter, r *http.Request) {
 		writeError(w, determineErrorStatus(err), err.Error())
 		return
 	}
-
+	writeLog("Deleted Template With Id:" + id)
 	writeJSON(w, http.StatusOK, map[string]string{"message": "template deleted"})
 }
 
@@ -218,6 +240,7 @@ type CreateNotificationRequest struct {
 // @Failure      422  {object}  map[string]string
 // @Failure      500  {object}  map[string]string
 // @Router       /notifications [post]
+
 func (h *Handler) CreateNotification(w http.ResponseWriter, r *http.Request) {
 	var req CreateNotificationRequest
 	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
@@ -238,8 +261,70 @@ func (h *Handler) CreateNotification(w http.ResponseWriter, r *http.Request) {
 		writeError(w, determineErrorStatus(err), err.Error())
 		return
 	}
-
+	writeLog("Created notification with ID: " + n.ID + " with TemplateID: " + n.TemplateID + "Content is: " + n.Message)
 	writeJSON(w, http.StatusCreated, n)
+}
+
+func (h *Handler) SendJobNotification(req *pb.JobEvent) {
+	log := logger.NewLogger("job-queue-notification")
+
+	data := map[string]string{
+		"job_id":    req.JobId,
+		"stage":     req.Stage,
+		"message":   req.Message,
+		"file_name": req.FileName,
+		"job_type":  req.Jobtype,
+	}
+
+	_, err := h.service.CreateNotification(
+		"system_user",
+		map[string]string{"email": "sahilkanani8320@gmail.com"},
+		"job_notification_template",
+		data,
+		models.PriorityHigh,
+		models.TypeInfo,
+	)
+
+	if err != nil {
+		log.Error("Failed to send job notification: " + err.Error())
+	} else {
+		log.Info("Job notification sent successfully for job ID: " + req.JobId)
+	}
+}
+
+func (s *GRPCServer) StreamEvents(stream pb.NotificationService_StreamEventsServer) error {
+
+	var log = logger.NewLogger("job-queue")
+	for {
+		req, err := stream.Recv()
+
+		if err == io.EOF {
+			return stream.SendAndClose(&pb.Ack{
+				Status: "done",
+			})
+		}
+
+		if err != nil {
+			return err
+		}
+
+		// :fire: NEW: check level
+		if req.Jobtype == "WARNING" {
+			var errLog = logger.NewLogger("job-queue-error")
+			errLog.Error(req.Message + " with retry count: " + string(req.RetryCount) + " and file name: " + req.FileName)
+		} else {
+			log.Info("Received job: " + req.Message + " with retry count: " + string(req.RetryCount) + " and file name: " + req.FileName)
+		}
+
+		if req.Stage == "COMPLETED" {
+			log.Info("Job completed: " + req.Message)
+			s.h.SendJobNotification(req)
+		} else if req.Stage == "FAILED" {
+			log.Error("Job failed: " + req.Message)
+		} else {
+
+		}
+	}
 }
 
 // GetUserNotifications handles GET /notifications/user/{user_id}
@@ -263,7 +348,7 @@ func (h *Handler) GetUserNotifications(w http.ResponseWriter, r *http.Request) {
 		writeError(w, determineErrorStatus(err), err.Error())
 		return
 	}
-
+	writeLog("Getting notifications for user: " + userID)
 	writeJSON(w, http.StatusOK, notifications)
 }
 
@@ -283,5 +368,6 @@ func (h *Handler) MarkAsRead(w http.ResponseWriter, r *http.Request) {
 		writeError(w, determineErrorStatus(err), err.Error())
 		return
 	}
+	writeLog("Marked notification as read with ID: " + id)
 	writeJSON(w, http.StatusOK, map[string]string{"message": "notification marked as read"})
 }

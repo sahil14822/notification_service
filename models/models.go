@@ -34,21 +34,21 @@ const (
 
 // Template is a reusable notification template with {{placeholder}} syntax.
 type Template struct {
-	ID        string    `json:"template_id"  bson:"_id"`
-	Content   string    `json:"content"      bson:"content"`
-	IsDeleted bool      `json:"is_deleted"   bson:"is_deleted,omitempty"`
-	CreatedAt time.Time `json:"created_at"   bson:"created_at"`
+	ID        string    `json:"template_id"`
+	Content   string    `json:"content"`
+	IsDeleted bool      `json:"is_deleted"`
+	CreatedAt time.Time `json:"created_at"`
 }
 
 // Notification is the final rendered message sent to a user.
 type Notification struct {
-	ID         string    `json:"id"          bson:"_id"`
-	UserID     string    `json:"user_id"     bson:"user_id"`
-	TemplateID string    `json:"template_id" bson:"template_id"`
-	Message    string           `json:"message"     bson:"message"`
-	Targets    map[string]string `json:"targets"     bson:"targets"`
-	Priority   Priority         `json:"priority"    bson:"priority"`
-	Type       NotificationType `json:"type"        bson:"type"`
-	Read       bool             `json:"read"        bson:"read"`
-	CreatedAt  time.Time        `json:"created_at"  bson:"created_at"`
+	ID         string            `json:"id"`
+	UserID     string            `json:"user_id"`
+	TemplateID string            `json:"template_id"`
+	Message    string            `json:"message"`
+	Targets    map[string]string `json:"targets"`
+	Priority   Priority          `json:"priority"`
+	Type       NotificationType  `json:"type"`
+	Read       bool              `json:"read"`
+	CreatedAt  time.Time         `json:"created_at"`
 }

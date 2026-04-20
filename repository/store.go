@@ -1,207 +1,369 @@
-// Package store provides MongoDB-backed storage for templates and notifications.
+// Package repository provides Cassandra-backed storage for templates and notifications.
 package repository
 
 import (
 	"context"
-	"errors"
+	"encoding/json"
+	"fmt"
+	"strings"
 	"time"
 
-	"go.mongodb.org/mongo-driver/v2/bson"
-	"go.mongodb.org/mongo-driver/v2/mongo"
-	"go.mongodb.org/mongo-driver/v2/mongo/options"
+	"github.com/gocql/gocql"
 
 	"notification-service/models"
 )
 
-// Store wraps MongoDB collections for templates and notifications.
+// Store wraps a Cassandra session for templates and notifications.
 type Store struct {
-	client        *mongo.Client
-	templates     *mongo.Collection
-	notifications *mongo.Collection
+	session  *gocql.Session
+	keyspace string
 }
 
-// New connects to MongoDB, ensures indexes, and returns a ready Store.
-// mongoURI = "mongodb+srv://sahilkanani8320_db_user:Sahil@testcluster.kzigwb7.mongodb.net/?appName=testCluster"
+// New connects to Cassandra, bootstraps the schema, and returns a ready Store.
+//
+// hosts    — comma-separated contact points, e.g. "127.0.0.1" or "node1,node2"
+// keyspace — Cassandra keyspace to use, e.g. "notification_service"
+func New(_ context.Context, hosts string, keyspace string) (*Store, error) {
+	hostList := strings.Split(hosts, ",")
+	for i := range hostList {
+		hostList[i] = strings.TrimSpace(hostList[i])
+	}
 
-func New(ctx context.Context, mongoURI string) (*Store, error) {
-	opts := options.Client().ApplyURI(mongoURI)
-	client, err := mongo.Connect(opts)
+	// ── Step 1: connect without a keyspace to create it if missing ──────────
+	bootstrap := gocql.NewCluster(hostList...)
+	bootstrap.Consistency = gocql.One
+	bootstrap.Timeout = 30 * time.Second
+	bootstrap.ConnectTimeout = 30 * time.Second
+
+	initSession, err := bootstrap.CreateSession()
 	if err != nil {
-		return nil, err
+		return nil, fmt.Errorf("cassandra: initial connect failed: %w", err)
 	}
 
-	// Verify connectivity.
-	pingCtx, cancel := context.WithTimeout(ctx, 5*time.Second)
-	defer cancel()
-	if err := client.Ping(pingCtx, nil); err != nil {
-		return nil, err
+	createKS := fmt.Sprintf(`
+		CREATE KEYSPACE IF NOT EXISTS %s
+		WITH replication = {
+			'class': 'SimpleStrategy',
+			'replication_factor': 1
+		}`, keyspace)
+
+	if err := initSession.Query(createKS).Exec(); err != nil {
+		initSession.Close()
+		return nil, fmt.Errorf("cassandra: create keyspace %q: %w", keyspace, err)
+	}
+	initSession.Close()
+
+	// ── Step 2: reconnect with the keyspace ─────────────────────────────────
+	cluster := gocql.NewCluster(hostList...)
+	cluster.Keyspace = keyspace
+	cluster.Consistency = gocql.One
+	cluster.Timeout = 30 * time.Second
+	cluster.ConnectTimeout = 30 * time.Second
+
+	session, err := cluster.CreateSession()
+	if err != nil {
+		return nil, fmt.Errorf("cassandra: connect to keyspace %q: %w", keyspace, err)
 	}
 
-	db := client.Database("notification_service")
-	s := &Store{
-		client:        client,
-		templates:     db.Collection("templates"),
-		notifications: db.Collection("notifications"),
-	}
+	s := &Store{session: session, keyspace: keyspace}
 
-	// Create an index on notifications.user_id for fast per-user lookups.
-	if err := s.ensureIndexes(ctx); err != nil {
-		return nil, err
+	if err := s.bootstrapSchema(); err != nil {
+		session.Close()
+		return nil, fmt.Errorf("cassandra: schema bootstrap: %w", err)
 	}
 
 	return s, nil
 }
 
-// ensureIndexes creates required MongoDB indexes if they don't already exist.
-func (s *Store) ensureIndexes(ctx context.Context) error {
-	idxModel := mongo.IndexModel{
-		Keys: bson.D{{Key: "user_id", Value: 1}},
+// bootstrapSchema creates required tables and indexes when they don't exist.
+//
+// Tables:
+//
+//	templates     — keyed by id (TEXT PRIMARY KEY)
+//	notifications — keyed by id (TEXT PRIMARY KEY) + secondary index on user_id
+func (s *Store) bootstrapSchema() error {
+	stmts := []string{
+		// ── templates ────────────────────────────────────────────────────────
+		`CREATE TABLE IF NOT EXISTS templates (
+			id         TEXT PRIMARY KEY,
+			content    TEXT,
+			is_deleted BOOLEAN,
+			created_at TIMESTAMP
+		)`,
+
+		// Ensure is_deleted column exists (for migrations)
+		`ALTER TABLE templates ADD is_deleted BOOLEAN`,
+
+		// Index for filtering deleted templates
+		`CREATE INDEX IF NOT EXISTS templates_is_deleted_idx
+			ON templates (is_deleted)`,
+
+		// ── notifications ────────────────────────────────────────────────────
+		// PRIMARY KEY is notification-id so we can UPDATE/SELECT by id directly.
+		// A secondary index on user_id supports efficient per-user queries.
+		`CREATE TABLE IF NOT EXISTS notifications (
+			id          TEXT PRIMARY KEY,
+			user_id     TEXT,
+			template_id TEXT,
+			message     TEXT,
+			targets     TEXT,
+			priority    TEXT,
+			type        TEXT,
+			read        BOOLEAN,
+			created_at  TIMESTAMP
+		)`,
+
+		// Secondary index — allows SELECT … WHERE user_id = ? efficiently.
+		`CREATE INDEX IF NOT EXISTS notifications_user_id_idx
+			ON notifications (user_id)`,
 	}
-	_, err := s.notifications.Indexes().CreateOne(ctx, idxModel)
-	return err
-}
 
-// Close disconnects the MongoDB client.
-func (s *Store) Close(ctx context.Context) error {
-	return s.client.Disconnect(ctx)
-}
-
-// ─── Template Methods ────────────────────────────────────────────────────────
-
-// SaveTemplate inserts a new template. Returns ErrTemplateAlreadyExists on duplicate ID.
-func (s *Store) SaveTemplate(t *models.Template) error {
-	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
-	defer cancel()
-
-	_, err := s.templates.InsertOne(ctx, t)
-	if err != nil {
-		var writeErr mongo.WriteException
-		if errors.As(err, &writeErr) {
-			for _, we := range writeErr.WriteErrors {
-				if we.Code == 11000 { // duplicate key
-					return models.ErrTemplateAlreadyExists
-				}
+	for _, stmt := range stmts {
+		if err := s.session.Query(stmt).Exec(); err != nil {
+			// Ignore error if column/index already exists (for ALTER/CREATE)
+			errStr := strings.ToLower(err.Error())
+			if strings.Contains(errStr, "already exists") || strings.Contains(errStr, "conflict") {
+				continue
 			}
+
+			// Trim the statement so the error message stays readable.
+			preview := stmt
+			if len(preview) > 60 {
+				preview = preview[:60] + "..."
+			}
+			return fmt.Errorf("executing %q: %w", preview, err)
 		}
-		return err
 	}
 	return nil
 }
 
-// GetTemplate returns a template by ID.
-func (s *Store) GetTemplate(id string) (*models.Template, error) {
-	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
-	defer cancel()
+// Close terminates the Cassandra session.
+func (s *Store) Close(_ context.Context) error {
+	s.session.Close()
+	return nil
+}
 
+// ─── Template Methods ─────────────────────────────────────────────────────────
+
+// SaveTemplate inserts a new template using a Lightweight Transaction (IF NOT EXISTS).
+// Returns models.ErrTemplateAlreadyExists when the ID is already taken.
+//
+// CQL:
+//
+//	INSERT INTO templates (id, content, created_at) VALUES (?, ?, ?) IF NOT EXISTS
+func (s *Store) SaveTemplate(t *models.Template) error {
+	var existingID, existingContent *string
+	var existingCreatedAt *time.Time
+	var existingIsDeleted bool
+
+	applied, err := s.session.Query(`
+		INSERT INTO templates (id, content, is_deleted, created_at)
+		VALUES (?, ?, ?, ?)
+		IF NOT EXISTS`,
+		t.ID, t.Content, false, t.CreatedAt,
+	).ScanCAS(&existingID, &existingContent, &existingIsDeleted, &existingCreatedAt)
+
+	if err != nil {
+		return fmt.Errorf("SaveTemplate: %w", err)
+	}
+	if !applied {
+		return models.ErrTemplateAlreadyExists
+	}
+	return nil
+}
+
+// GetTemplate returns a single template by ID if not deleted.
+//
+// CQL:
+//
+//	SELECT id, content, is_deleted, created_at FROM templates WHERE id = ?
+func (s *Store) GetTemplate(id string) (*models.Template, error) {
 	var t models.Template
-	err := s.templates.FindOne(ctx, bson.M{"_id": id, "is_deleted": bson.M{"$ne": true}}).Decode(&t)
-	if errors.Is(err, mongo.ErrNoDocuments) {
+	err := s.session.Query(`
+		SELECT id, content, is_deleted, created_at
+		FROM templates
+		WHERE id = ?`,
+		id,
+	).Scan(&t.ID, &t.Content, &t.IsDeleted, &t.CreatedAt)
+
+	if err == gocql.ErrNotFound {
 		return nil, models.ErrTemplateNotFound
 	}
 	if err != nil {
-		return nil, err
+		return nil, fmt.Errorf("GetTemplate: %w", err)
 	}
+
+	if t.IsDeleted {
+		return nil, models.ErrTemplateNotFound
+	}
+
 	return &t, nil
 }
 
 // UpdateTemplate updates the content of an existing template.
+// Returns models.ErrTemplateNotFound if the ID does not exist.
+//
+// CQL:
+//
+//	UPDATE templates SET content = ? WHERE id = ?
 func (s *Store) UpdateTemplate(t *models.Template) error {
-	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
-	defer cancel()
-
-	res, err := s.templates.UpdateOne(
-		ctx,
-		bson.M{"_id": t.ID, "is_deleted": bson.M{"$ne": true}},
-		bson.M{"$set": bson.M{"content": t.Content}},
-	)
-	if err != nil {
-		return err
+	// Existence check — Cassandra UPDATE is an upsert, so we check explicitly.
+	if _, err := s.GetTemplate(t.ID); err != nil {
+		return err // propagates ErrTemplateNotFound
 	}
-	if res.MatchedCount == 0 {
-		return models.ErrTemplateNotFound
+
+	if err := s.session.Query(`
+		UPDATE templates SET content = ? WHERE id = ?`,
+		t.Content, t.ID,
+	).Exec(); err != nil {
+		return fmt.Errorf("UpdateTemplate: %w", err)
 	}
 	return nil
 }
 
+// DeleteTemplate soft-deletes a template by ID.
+// Returns models.ErrTemplateNotFound if the ID does not exist.
+//
+// CQL:
+//
+//	UPDATE templates SET is_deleted = true WHERE id = ?
 func (s *Store) DeleteTemplate(id string) error {
-	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
-	defer cancel()
-
-	res, err := s.templates.UpdateOne(
-		ctx, 
-		bson.M{"_id": id, "is_deleted": bson.M{"$ne": true}},
-		bson.M{"$set": bson.M{"is_deleted": true}},
-	)
-	if err != nil {
-		return err
+	// Existence check
+	if _, err := s.GetTemplate(id); err != nil {
+		return err // propagates ErrTemplateNotFound
 	}
-	if res.MatchedCount == 0 {
-		return models.ErrTemplateNotFound
+
+	if err := s.session.Query(`
+		UPDATE templates SET is_deleted = true WHERE id = ?`, id,
+	).Exec(); err != nil {
+		return fmt.Errorf("DeleteTemplate: %w", err)
 	}
 	return nil
 }
 
-// AllTemplates returns a slice of all templates.
+// AllTemplates returns all non-deleted templates.
+//
+// CQL:
+//
+//	SELECT id, content, is_deleted, created_at FROM templates WHERE is_deleted = false
 func (s *Store) AllTemplates() []*models.Template {
-	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
-	defer cancel()
+	iter := s.session.Query(`
+		SELECT id, content, is_deleted, created_at FROM templates
+		WHERE is_deleted = false ALLOW FILTERING`,
+	).Iter()
 
-	cursor, err := s.templates.Find(ctx, bson.M{"is_deleted": bson.M{"$ne": true}})
-	if err != nil {
+	var results []*models.Template
+	var t models.Template
+	for iter.Scan(&t.ID, &t.Content, &t.IsDeleted, &t.CreatedAt) {
+		cp := t // copy before taking address
+		results = append(results, &cp)
+	}
+
+	if err := iter.Close(); err != nil {
 		return []*models.Template{}
 	}
-	defer cursor.Close(ctx)
-
-	var result []*models.Template
-	if err := cursor.All(ctx, &result); err != nil {
+	if results == nil {
 		return []*models.Template{}
 	}
-	return result
+	return results
 }
 
-// ─── Notification Methods ────────────────────────────────────────────────────
+// ─── Notification Methods ─────────────────────────────────────────────────────
 
 // SaveNotification persists a new notification.
+// The Targets map is JSON-encoded because Cassandra maps require fixed value types.
+//
+// CQL:
+//
+//	INSERT INTO notifications (id, user_id, template_id, message, targets,
+//	                           priority, type, read, created_at)
+//	VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
 func (s *Store) SaveNotification(n *models.Notification) {
-	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
-	defer cancel()
+	targetsJSON, _ := json.Marshal(n.Targets)
 
-	s.notifications.InsertOne(ctx, n) //nolint:errcheck
+	_ = s.session.Query(`
+		INSERT INTO notifications
+			(id, user_id, template_id, message, targets, priority, type, read, created_at)
+		VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+		n.ID, n.UserID, n.TemplateID, n.Message,
+		string(targetsJSON),
+		string(n.Priority), string(n.Type), n.Read, n.CreatedAt,
+	).Exec() //nolint:errcheck
 }
 
-// GetNotificationsByUser returns all notifications for a given user_id.
+// GetNotificationsByUser returns all notifications for the given user_id.
+// Uses the secondary index on user_id.
+//
+// CQL:
+//
+//	SELECT id, user_id, template_id, message, targets, priority, type, read, created_at
+//	FROM notifications WHERE user_id = ?
 func (s *Store) GetNotificationsByUser(userID string) []*models.Notification {
-	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
-	defer cancel()
+	iter := s.session.Query(`
+		SELECT id, user_id, template_id, message, targets, priority, type, read, created_at
+		FROM notifications
+		WHERE user_id = ?`,
+		userID,
+	).Iter()
 
-	cursor, err := s.notifications.Find(ctx, bson.M{"user_id": userID})
-	if err != nil {
+	var results []*models.Notification
+	for {
+		var n models.Notification
+		var targetsJSON string
+		var priority, nType string
+
+		if !iter.Scan(
+			&n.ID, &n.UserID, &n.TemplateID, &n.Message, &targetsJSON,
+			&priority, &nType, &n.Read, &n.CreatedAt,
+		) {
+			break
+		}
+
+		n.Priority = models.Priority(priority)
+		n.Type = models.NotificationType(nType)
+		_ = json.Unmarshal([]byte(targetsJSON), &n.Targets)
+
+		cp := n
+		results = append(results, &cp)
+	}
+
+	if err := iter.Close(); err != nil {
 		return []*models.Notification{}
 	}
-	defer cursor.Close(ctx)
-
-	var result []*models.Notification
-	if err := cursor.All(ctx, &result); err != nil {
+	if results == nil {
 		return []*models.Notification{}
 	}
-	return result
+	return results
 }
 
-// MarkNotificationRead sets a notification's Read field to true.
+// MarkNotificationRead sets a notification's `read` field to true.
+// Fetches the row first to confirm it exists; returns ErrNotificationNotFound if not.
+//
+// CQL (check):
+//
+//	SELECT id FROM notifications WHERE id = ?
+//
+// CQL (update):
+//
+//	UPDATE notifications SET read = true WHERE id = ?
 func (s *Store) MarkNotificationRead(id string) error {
-	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
-	defer cancel()
+	// Verify the notification exists (Cassandra UPDATE is an upsert).
+	var existingID string
+	err := s.session.Query(`
+		SELECT id FROM notifications WHERE id = ?`, id,
+	).Scan(&existingID)
 
-	res, err := s.notifications.UpdateOne(
-		ctx,
-		bson.M{"_id": id},
-		bson.M{"$set": bson.M{"read": true}},
-	)
-	if err != nil {
-		return err
-	}
-	if res.MatchedCount == 0 {
+	if err == gocql.ErrNotFound {
 		return models.ErrNotificationNotFound
+	}
+	if err != nil {
+		return fmt.Errorf("MarkNotificationRead (check): %w", err)
+	}
+
+	if err := s.session.Query(`
+		UPDATE notifications SET read = true WHERE id = ?`, id,
+	).Exec(); err != nil {
+		return fmt.Errorf("MarkNotificationRead (update): %w", err)
 	}
 	return nil
 }

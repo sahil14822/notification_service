@@ -22,8 +22,6 @@ This service is structured using standard Go **Clean Architecture** patterns:
 1. **Configure Environment Variables:**
    We strictly use a `.env` file to prevent pushing credentials into git. Create a `.env` file in the root folder with the following structure:
    ```env
-   # MongoDB
-   MONGO_URI=mongodb+srv://<username>:<password>@<cluster-url>/?appName=testCluster
 
    # SMTP Email
    SMTP_HOST=smtp.gmail.com

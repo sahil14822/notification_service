@@ -40,7 +40,7 @@ func (s *SMSProvider) Send(notification *models.Notification, target string) err
 	params := &openapi.CreateMessageParams{}
 	params.SetTo(target)
 	params.SetFrom(fromNumber)
-	params.SetBody(notification.Message)
+	params.SetBody(notification.Message) 
 
 	_, err := client.Api.CreateMessage(params)
 	if err != nil {

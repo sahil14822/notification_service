@@ -28,6 +28,7 @@ func (s *Service) CreateTemplate(id, content string) (*TemplateResponse, error) 
 		ID:        id,
 		Content:   content,
 		CreatedAt: time.Now(),
+		IsDeleted: false,
 	}
 
 	if err := s.repo.SaveTemplate(t); err != nil {
